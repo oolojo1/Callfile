@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import math
+import numpy as np
+import pandas as pd
+
+# --- Config (edit if needed) ---
+INPUT_XLSX = "Tesco_Input.xlsx"
+OUTPUT_CSV = "Tesco_Balanced_Callfile.csv"
+TARGET_N = 165
+ID_COL = "TES Store #"
+MOD_COL = "Final Total Core Toy Mod Count"   # Column H in your file
+STAFF_COL = "Staffing Type"                  # Column G
+MAX_STAFF_SHARE = 0.65                       # soft cap per stratum
+RANDOM_STATE = 42
+
+# --- Helpers ---
+def _alloc_equal_with_capacity(total, capacities):
+    """Equal quotas over keys, capped by capacity; remainder to keys with most headroom."""
+    keys = list(sorted(capacities))
+    K = len(keys)
+    if K == 0 or total <= 0:
+        return {k: 0 for k in keys}
+    base = total // K
+    rem = total % K
+    alloc = {k: min(base, capacities[k]) for k in keys}
+    # distribute remainder to those with most headroom
+    order = sorted(keys, key=lambda k: capacities[k] - alloc[k], reverse=True)
+    i = 0
+    while rem > 0 and any(capacities[k] - alloc[k] > 0 for k in keys):
+        k = order[i % len(order)]
+        if capacities[k] - alloc[k] > 0:
+            alloc[k] += 1
+            rem -= 1
+        i += 1
+    return alloc
+
+def _staff_balanced_sample(stratum, k, staff_col, rng, max_share=0.65):
+    """Sample k rows from stratum, capping any single staffing type to ~max_share of k."""
+    if k <= 0 or stratum.empty or staff_col not in stratum.columns:
+        return stratum.head(0)
+    counts = stratum[staff_col].fillna("UNKNOWN").value_counts().to_dict()
+    types = list(counts.keys())
+    # per-type cap
+    cap = {t: min(counts[t], int(math.floor(max_share * k))) for t in types}
+    # even floor allocation
+    base_k = k // max(1, len(types))
+    alloc = {t: min(base_k, counts[t], cap[t]) for t in types}
+    remaining = k - sum(alloc.values())
+    # fill to caps first
+    while remaining > 0:
+        progressed = False
+        order = sorted(types, key=lambda t: (cap[t]-alloc[t], counts[t]-alloc[t]), reverse=True)
+        for t in order:
+            if remaining <= 0: break
+            if alloc[t] < min(cap[t], counts[t]):
+                alloc[t] += 1; remaining -= 1; progressed = True
+        if not progressed: break
+    # relax caps if still remaining
+    while remaining > 0:
+        progressed = False
+        order = sorted(types, key=lambda t: (counts[t]-alloc[t]), reverse=True)
+        for t in order:
+            if remaining <= 0: break
+            take = min(remaining, counts[t]-alloc[t])
+            if take > 0:
+                alloc[t] += take; remaining -= take; progressed = True
+        if not progressed: break
+    # draw
+    parts = []
+    for t, n in alloc.items():
+        if n > 0:
+            parts.append(
+                stratum[stratum[staff_col].fillna("UNKNOWN")==t]
+                .sample(n=n, random_state=rng.integers(0, 1_000_000))
+            )
+    return pd.concat(parts, ignore_index=True) if parts else stratum.sample(n=min(k, len(stratum)), random_state=rng.integers(0, 1_000_000))
+
+# --- Main ---
+if __name__ == "__main__":
+    rng = np.random.default_rng(RANDOM_STATE)
+
+    # Load Excel (simple)
+    df = pd.read_excel(INPUT_XLSX)
+
+    # Basic hygiene
+    if MOD_COL not in df.columns:
+        raise KeyError(f"Missing required column: {MOD_COL}")
+    if ID_COL not in df.columns:
+        raise KeyError(f"Missing required column: {ID_COL}")
+
+    df = df.dropna(subset=[MOD_COL]).copy()
+    # tidy types
+    if pd.api.types.is_numeric_dtype(df[MOD_COL]):
+        df[MOD_COL] = df[MOD_COL].astype(int)
+    # normalise staffing to avoid 'eXPD8' vs 'expd8'
+    if STAFF_COL in df.columns:
+        df[STAFF_COL] = df[STAFF_COL].astype(str).str.strip().str.upper()
+
+    # Equal-by-MOD quotas (primary balance)
+    mods = sorted(df[MOD_COL].unique())
+    capacities = {m: int((df[df[MOD_COL]==m]).shape[0]) for m in mods}
+    total_target = min(TARGET_N, len(df))
+    quotas = _alloc_equal_with_capacity(total_target, capacities)
+
+    # Sample per MOD with a light staffing cap
+    picks = []
+    for m, q in quotas.items():
+        if q <= 0: 
+            continue
+        stratum = df[df[MOD_COL] == m]
+        if STAFF_COL in df.columns and not stratum.empty:
+            picks.append(_staff_balanced_sample(stratum, q, STAFF_COL, rng, max_share=MAX_STAFF_SHARE))
+        else:
+            picks.append(stratum.sample(n=min(q, len(stratum)), random_state=rng.integers(0, 1_000_000)))
+
+    selected = pd.concat(picks, ignore_index=True) if picks else df.head(0)
+
+    # Top-up if some strata were short (avoid duplicates by ID)
+    if len(selected) < total_target:
+        need = total_target - len(selected)
+        remaining = df[~df[ID_COL].astype(str).isin(selected[ID_COL].astype(str))]
+        if not remaining.empty:
+            selected = pd.concat(
+                [selected, remaining.sample(n=min(need, len(remaining)), random_state=RANDOM_STATE)],
+                ignore_index=True
+            )
+
+    # Save CSV + tiny summary
+    selected.to_csv(OUTPUT_CSV, index=False)
+    print("Saved:", OUTPUT_CSV)
+    print("Selected:", len(selected))
+    print("By MOD:", selected[MOD_COL].value_counts().sort_index().to_dict())
+    if STAFF_COL in selected.columns:
+        print("By Staffing:", selected[STAFF_COL].value_counts().to_dict())
